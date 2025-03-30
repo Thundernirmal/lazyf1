@@ -1,31 +1,102 @@
 #!/usr/bin/env python3
 
 import os
+import logging
 import fastf1
 import pandas as pd
 from datetime import datetime
 from rich.table import Table
 from rich.panel import Panel
+from rich.spinner import Spinner
+from rich.text import Text
+from rich.align import Align
+from rich.console import RenderableType
 from textual.app import App
-from textual.widgets import Header, Footer, Static, Button
-from textual.containers import Container, Horizontal
+from textual.widgets import Header, Footer, Static, Button, LoadingIndicator
+from textual.containers import Container, Horizontal, Vertical
 from textual.reactive import reactive
 from textual.binding import Binding
 
+# Set up logging to file
+log_dir = os.path.join(os.path.expanduser("~"), ".f1dashboard")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "f1dashboard.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    filename=log_file,
+    filemode='a'
+)
+
+# Redirect FastF1 logs
+for logger_name in ["fastf1", "fastf1.core", "fastf1.api", "fastf1.ergast", "fastf1.plotting"]:
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.INFO)
+    # Remove any existing handlers
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    # Add file handler
+    handler = logging.FileHandler(log_file)
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logger.addHandler(handler)
+
 # Create cache directory if it doesn't exist
-cache_dir = "./cache"
+cache_dir = os.path.join(log_dir, "cache")
 os.makedirs(cache_dir, exist_ok=True)
 
 # Enable FastF1 cache
 fastf1.Cache.enable_cache(cache_dir)
 
+# Define TokyoNight colors
+TOKYO_NIGHT = {
+    "background": "#1a1b26",
+    "foreground": "#c0caf5",
+    "black": "#15161e",
+    "red": "#f7768e",
+    "green": "#9ece6a",
+    "yellow": "#e0af68",
+    "blue": "#7aa2f7",
+    "magenta": "#bb9af7",
+    "cyan": "#7dcfff",
+    "white": "#a9b1d6",
+    "bright_black": "#414868",
+    "bright_red": "#f7768e",
+    "bright_green": "#9ece6a",
+    "bright_yellow": "#e0af68",
+    "bright_blue": "#7aa2f7",
+    "bright_magenta": "#bb9af7",
+    "bright_cyan": "#7dcfff",
+    "bright_white": "#c0caf5",
+    "accent": "#7aa2f7"
+}
+
+class LoadingState:
+    """Class to manage loading state for widgets"""
+    def __init__(self):
+        self.is_loading = False
+        self.loading_message = ""
+        self.callbacks = []
+
+    def set_loading(self, is_loading, message="Loading data..."):
+        self.is_loading = is_loading
+        self.loading_message = message
+        for callback in self.callbacks:
+            callback(is_loading, message)
+
+    def add_callback(self, callback):
+        self.callbacks.append(callback)
+
+
 class F1Data:
     def __init__(self):
         self.current_year = datetime.now().year
         self.selected_race_index = -1  # -1 means most recent race
+        self.loading_state = LoadingState()
 
     def get_driver_standings(self):
         """Get current driver standings"""
+        self.loading_state.set_loading(True, "Fetching driver standings...")
         try:
             # Use ergast API directly through fastf1 since get_driver_standings doesn't exist
             # Load the most recent race to get standings
@@ -34,6 +105,7 @@ class F1Data:
             completed_races = schedule[schedule['EventDate'] < pd.Timestamp(datetime.now())]
 
             if completed_races.empty:
+                self.loading_state.set_loading(False)
                 return [{"position": "N/A", "driver": "No completed races", "team": "", "points": "", "wins": ""}]
 
             # Get the most recent race
@@ -88,12 +160,16 @@ class F1Data:
                     "wins": data['wins']
                 })
 
+            self.loading_state.set_loading(False)
             return standings
         except Exception as e:
-            return [{"position": "Error", "driver": str(e), "team": "", "points": "", "wins": ""}]
+            logging.error(f"Error getting driver standings: {e}")
+            self.loading_state.set_loading(False)
+            return [{"position": "Error", "driver": "Failed to load data", "team": "", "points": "", "wins": ""}]
 
     def get_team_standings(self):
         """Get current constructor standings"""
+        self.loading_state.set_loading(True, "Fetching team standings...")
         try:
             # Use the same approach as driver standings
             # Get all races in the current year
@@ -101,6 +177,7 @@ class F1Data:
             completed_races = schedule[schedule['EventDate'] < pd.Timestamp(datetime.now())]
 
             if completed_races.empty:
+                self.loading_state.set_loading(False)
                 return [{"position": "N/A", "team": "No completed races", "nationality": "", "points": "", "wins": ""}]
 
             # Collect team data
@@ -141,9 +218,12 @@ class F1Data:
                     "wins": data['wins']
                 })
 
+            self.loading_state.set_loading(False)
             return standings
         except Exception as e:
-            return [{"position": "Error", "team": str(e), "nationality": "", "points": "", "wins": ""}]
+            logging.error(f"Error getting team standings: {e}")
+            self.loading_state.set_loading(False)
+            return [{"position": "Error", "team": "Failed to load data", "nationality": "", "points": "", "wins": ""}]
 
     def _get_team_nationality(self, team_name):
         """Map team name to nationality (simplified)"""
@@ -165,6 +245,7 @@ class F1Data:
 
     def get_race_schedule(self):
         """Get race schedule for the current season"""
+        self.loading_state.set_loading(True, "Fetching race schedule...")
         try:
             # Get race schedule
             schedule = fastf1.get_event_schedule(self.current_year)
@@ -187,9 +268,12 @@ class F1Data:
                     "status": status
                 })
 
+            self.loading_state.set_loading(False)
             return races
         except Exception as e:
-            return [{"round": "Error", "name": str(e), "circuit": "", "date": "", "status": ""}]
+            logging.error(f"Error getting race schedule: {e}")
+            self.loading_state.set_loading(False)
+            return [{"round": "Error", "name": "Failed to load data", "circuit": "", "date": "", "status": ""}]
 
     def get_completed_races(self):
         """Get list of completed races"""
@@ -198,14 +282,17 @@ class F1Data:
             completed_races = schedule[schedule['EventDate'] < pd.Timestamp(datetime.now())]
             return completed_races
         except Exception as e:
+            logging.error(f"Error getting completed races: {e}")
             return pd.DataFrame()
 
     def get_race_results(self, race_index=None):
         """Get results from a specific race or the last completed race if race_index is None"""
+        self.loading_state.set_loading(True, "Fetching race results...")
         try:
             completed_races = self.get_completed_races()
 
             if completed_races.empty:
+                self.loading_state.set_loading(False)
                 return [{"position": "N/A", "driver": "No completed races", "team": "", "time": "", "points": ""}]
 
             # If race_index is None or -1, get the most recent race
@@ -240,26 +327,72 @@ class F1Data:
                     "race_name": race_name  # Include race name for display
                 })
 
+            self.loading_state.set_loading(False)
             return race_results
         except Exception as e:
-            return [{"position": "Error", "driver": str(e), "team": "", "time": "", "points": "", "race_name": "Error"}]
+            logging.error(f"Error getting race results: {e}")
+            self.loading_state.set_loading(False)
+            return [{"position": "Error", "driver": "Failed to load data", "team": "", "time": "", "points": "", "race_name": "Error"}]
 
 
-class DriverStandingsWidget(Static):
+class EnhancedLoadingIndicator(Static):
+    """A more visible loading indicator"""
+    def __init__(self, message: str = "Loading...", spinner_type: str = "dots12", *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.message = message
+        self.spinner_type = spinner_type
+
+    def on_mount(self):
+        self.update_timer = self.set_interval(0.1, self.refresh)
+        self.refresh()
+
+    def refresh(self):
+        spinner = Spinner(self.spinner_type, text=self.message)
+        self.update(Align.center(spinner))
+
+
+class LoadableWidget(Static):
+    """Base class for widgets that can show loading state"""
+    def __init__(self, *args, loading_state=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.loading_state = loading_state
+        self.is_loading = False
+        self.loading_message = "Loading..."
+        if loading_state:
+            loading_state.add_callback(self.on_loading_changed)
+
+    def on_loading_changed(self, is_loading, message):
+        self.is_loading = is_loading
+        self.loading_message = message
+        self.update_content()
+
+
+class DriverStandingsWidget(LoadableWidget):
     def on_mount(self):
         self.update_timer = self.set_interval(300, self.update_content)
         self.update_content()
 
     def update_content(self):
+        if self.is_loading:
+            content = Vertical(
+                EnhancedLoadingIndicator(self.loading_message, spinner_type="point"),
+                Text("Please wait...", style=TOKYO_NIGHT["white"]),
+                classes="loading-container"
+            )
+            self.update(Panel(content,
+                              title="Driver Standings",
+                              border_style=TOKYO_NIGHT["blue"]))
+            return
+
         f1_data = F1Data()
         standings = f1_data.get_driver_standings()
 
         table = Table(title=f"Driver Standings {f1_data.current_year}")
-        table.add_column("Pos", justify="right", style="cyan")
-        table.add_column("Driver", style="green")
-        table.add_column("Team", style="yellow")
-        table.add_column("Points", justify="right", style="magenta")
-        table.add_column("Wins", justify="right", style="red")
+        table.add_column("Pos", justify="right", style=TOKYO_NIGHT["cyan"])
+        table.add_column("Driver", style=TOKYO_NIGHT["green"])
+        table.add_column("Team", style=TOKYO_NIGHT["yellow"])
+        table.add_column("Points", justify="right", style=TOKYO_NIGHT["magenta"])
+        table.add_column("Wins", justify="right", style=TOKYO_NIGHT["red"])
 
         for driver in standings:
             table.add_row(
@@ -270,24 +403,35 @@ class DriverStandingsWidget(Static):
                 str(driver["wins"])
             )
 
-        self.update(Panel(table, border_style="bright_blue"))
+        self.update(Panel(table, border_style=TOKYO_NIGHT["blue"]))
 
 
-class TeamStandingsWidget(Static):
+class TeamStandingsWidget(LoadableWidget):
     def on_mount(self):
         self.update_timer = self.set_interval(300, self.update_content)
         self.update_content()
 
     def update_content(self):
+        if self.is_loading:
+            content = Vertical(
+                EnhancedLoadingIndicator(self.loading_message, spinner_type="point"),
+                Text("Please wait...", style=TOKYO_NIGHT["white"]),
+                classes="loading-container"
+            )
+            self.update(Panel(content,
+                              title="Constructor Standings",
+                              border_style=TOKYO_NIGHT["green"]))
+            return
+
         f1_data = F1Data()
         standings = f1_data.get_team_standings()
 
         table = Table(title=f"Constructor Standings {f1_data.current_year}")
-        table.add_column("Pos", justify="right", style="cyan")
-        table.add_column("Team", style="green")
-        table.add_column("Nationality", style="yellow")
-        table.add_column("Points", justify="right", style="magenta")
-        table.add_column("Wins", justify="right", style="red")
+        table.add_column("Pos", justify="right", style=TOKYO_NIGHT["cyan"])
+        table.add_column("Team", style=TOKYO_NIGHT["green"])
+        table.add_column("Nationality", style=TOKYO_NIGHT["yellow"])
+        table.add_column("Points", justify="right", style=TOKYO_NIGHT["magenta"])
+        table.add_column("Wins", justify="right", style=TOKYO_NIGHT["red"])
 
         for team in standings:
             table.add_row(
@@ -298,27 +442,38 @@ class TeamStandingsWidget(Static):
                 str(team["wins"])
             )
 
-        self.update(Panel(table, border_style="bright_green"))
+        self.update(Panel(table, border_style=TOKYO_NIGHT["green"]))
 
 
-class RaceScheduleWidget(Static):
+class RaceScheduleWidget(LoadableWidget):
     def on_mount(self):
         self.update_timer = self.set_interval(300, self.update_content)
         self.update_content()
 
     def update_content(self):
+        if self.is_loading:
+            content = Vertical(
+                EnhancedLoadingIndicator(self.loading_message, spinner_type="point"),
+                Text("Please wait...", style=TOKYO_NIGHT["white"]),
+                classes="loading-container"
+            )
+            self.update(Panel(content,
+                              title="Race Schedule",
+                              border_style=TOKYO_NIGHT["yellow"]))
+            return
+
         f1_data = F1Data()
         races = f1_data.get_race_schedule()
 
         table = Table(title=f"Race Schedule {f1_data.current_year}")
-        table.add_column("Round", justify="right", style="cyan")
-        table.add_column("Grand Prix", style="green")
-        table.add_column("Circuit", style="yellow")
-        table.add_column("Date", style="magenta")
-        table.add_column("Status", style="red")
+        table.add_column("Round", justify="right", style=TOKYO_NIGHT["cyan"])
+        table.add_column("Grand Prix", style=TOKYO_NIGHT["green"])
+        table.add_column("Circuit", style=TOKYO_NIGHT["yellow"])
+        table.add_column("Date", style=TOKYO_NIGHT["magenta"])
+        table.add_column("Status", style=TOKYO_NIGHT["red"])
 
         for race in races:
-            status_style = "bright_green" if race["status"] == "Completed" else "bright_yellow" if race["status"] == "In Progress" else "bright_blue"
+            status_style = TOKYO_NIGHT["green"] if race["status"] == "Completed" else TOKYO_NIGHT["yellow"] if race["status"] == "In Progress" else TOKYO_NIGHT["blue"]
             table.add_row(
                 str(race["round"]),
                 race["name"],
@@ -327,10 +482,10 @@ class RaceScheduleWidget(Static):
                 f"[{status_style}]{race['status']}[/]"
             )
 
-        self.update(Panel(table, border_style="bright_yellow"))
+        self.update(Panel(table, border_style=TOKYO_NIGHT["yellow"]))
 
 
-class RaceResultsWidget(Static):
+class RaceResultsWidget(LoadableWidget):
     race_index = reactive(-1)  # -1 means most recent race
 
     def on_mount(self):
@@ -375,6 +530,17 @@ class RaceResultsWidget(Static):
             self.race_index = -1
 
     def update_content(self):
+        if self.is_loading:
+            content = Vertical(
+                EnhancedLoadingIndicator(self.loading_message, spinner_type="point"),
+                Text("Please wait...", style=TOKYO_NIGHT["white"]),
+                classes="loading-container"
+            )
+            self.update(Panel(content,
+                              title="Race Results",
+                              border_style=TOKYO_NIGHT["red"]))
+            return
+
         f1_data = F1Data()
         results = f1_data.get_race_results(self.race_index)
 
@@ -382,11 +548,11 @@ class RaceResultsWidget(Static):
         title = f"Race Results {race_name} {f1_data.current_year}"
 
         table = Table(title=title)
-        table.add_column("Pos", justify="right", style="cyan")
-        table.add_column("Driver", style="green")
-        table.add_column("Team", style="yellow")
-        table.add_column("Time", style="magenta")
-        table.add_column("Points", justify="right", style="red")
+        table.add_column("Pos", justify="right", style=TOKYO_NIGHT["cyan"])
+        table.add_column("Driver", style=TOKYO_NIGHT["green"])
+        table.add_column("Team", style=TOKYO_NIGHT["yellow"])
+        table.add_column("Time", style=TOKYO_NIGHT["magenta"])
+        table.add_column("Points", justify="right", style=TOKYO_NIGHT["red"])
 
         for result in results:
             table.add_row(
@@ -397,7 +563,85 @@ class RaceResultsWidget(Static):
                 str(result["points"])
             )
 
-        self.update(Panel(table, border_style="bright_red"))
+        self.update(Panel(table, border_style=TOKYO_NIGHT["red"]))
+
+
+class GlobalLoadingOverlay(Static):
+    """A global overlay for loading state"""
+    DEFAULT_CSS = """
+    GlobalLoadingOverlay {
+        background: rgba(26, 27, 38, 0.8);
+        align: center middle;
+    }
+
+    .spinner-container {
+        background: #1a1b26;
+        border: solid #7aa2f7;
+        width: 50%;
+        height: 15;
+        align: center middle;
+        padding: 1;
+    }
+    """
+
+    def __init__(self, loading_state, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.loading_state = loading_state
+        self.loading_state.add_callback(self.on_loading_changed)
+        self.visible = False
+
+    def on_mount(self):
+        self.update_loading(False, "")
+
+    def on_loading_changed(self, is_loading, message):
+        self.update_loading(is_loading, message)
+
+    def update_loading(self, is_loading, message):
+        if is_loading:
+            content = Vertical(
+                EnhancedLoadingIndicator(message, spinner_type="dots12"),
+                Text("Processing data...", style=TOKYO_NIGHT["bright_white"]),
+                Text("This may take a moment", style=TOKYO_NIGHT["white"]),
+                classes="spinner-container"
+            )
+            self.update(content)
+            self.visible = True
+            self.styles.display = "block"
+        else:
+            self.visible = False
+            self.styles.display = "none"
+
+
+class StatusBar(Static):
+    """Status bar to show application state"""
+    def __init__(self, loading_state, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.loading_state = loading_state
+        self.loading_state.add_callback(self.on_loading_changed)
+
+    def on_mount(self):
+        self.update_status(False, "")
+
+    def on_loading_changed(self, is_loading, message):
+        self.update_status(is_loading, message)
+
+    def update_status(self, is_loading, message):
+        if is_loading:
+            status = Text.assemble(
+                ("⟳ ", TOKYO_NIGHT["yellow"]),
+                (message, TOKYO_NIGHT["bright_white"]),
+                (" | Logs: ", TOKYO_NIGHT["white"]),
+                (log_file, TOKYO_NIGHT["cyan"])
+            )
+        else:
+            status = Text.assemble(
+                ("✓ ", TOKYO_NIGHT["green"]),
+                ("Ready", TOKYO_NIGHT["bright_white"]),
+                (" | Logs: ", TOKYO_NIGHT["white"]),
+                (log_file, TOKYO_NIGHT["cyan"])
+            )
+
+        self.update(status)
 
 
 class RaceNavigationBar(Horizontal):
@@ -427,49 +671,96 @@ class F1DashboardApp(App):
         Binding("shift+tab", "focus_previous", "Previous Panel", show=False),
     ]
 
-    CSS = """
-    Screen {
-        background: #121212;
-    }
+    CSS = f"""
+    Screen {{
+        background: {TOKYO_NIGHT["background"]};
+        color: {TOKYO_NIGHT["foreground"]};
+    }}
 
-    #dashboard {
+    #dashboard {{
         layout: grid;
         grid-size: 2 2;
         grid-gutter: 1 1;
-        height: 95%;
+        height: 90%;
         margin: 1;
-    }
+    }}
 
-    #navigation {
+    #navigation {{
         dock: bottom;
-        height: 5;
+        height: 3;
         align: center middle;
-        background: #333;
+        background: {TOKYO_NIGHT["black"]};
         padding: 1;
-    }
+    }}
 
-    Button {
-        margin: 1 2;
-    }
+    #status_bar {{
+        dock: bottom;
+        height: 1;
+        background: {TOKYO_NIGHT["black"]};
+        color: {TOKYO_NIGHT["bright_white"]};
+        padding: 0 1;
+    }}
 
-    Static:focus {
-        border: heavy $accent;
-    }
+    Button {{
+        margin: 0 2;
+        background: {TOKYO_NIGHT["bright_black"]};
+        color: {TOKYO_NIGHT["foreground"]};
+    }}
+
+    Button:hover {{
+        background: {TOKYO_NIGHT["blue"]};
+    }}
+
+    LoadingIndicator {{
+        color: {TOKYO_NIGHT["yellow"]};
+    }}
+
+    .loading-container {{
+        width: 100%;
+        height: 100%;
+        align: center middle;
+        padding: 1;
+    }}
+
+    Static:focus {{
+        border: heavy {TOKYO_NIGHT["accent"]};
+    }}
+
+    Footer {{
+        background: {TOKYO_NIGHT["black"]};
+        color: {TOKYO_NIGHT["foreground"]};
+    }}
+
+    Header {{
+        background: {TOKYO_NIGHT["black"]};
+        color: {TOKYO_NIGHT["foreground"]};
+    }}
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.loading_state = LoadingState()
+        self.f1_data = F1Data()
+        self.f1_data.loading_state = self.loading_state
 
     def compose(self):
         yield Header(show_clock=True)
 
         with Container(id="dashboard"):
-            yield DriverStandingsWidget(id="drivers_panel")
-            yield TeamStandingsWidget(id="teams_panel")
-            yield RaceScheduleWidget(id="schedule_panel")
-            yield RaceResultsWidget(id="results_panel")
+            yield DriverStandingsWidget(id="drivers_panel", loading_state=self.loading_state)
+            yield TeamStandingsWidget(id="teams_panel", loading_state=self.loading_state)
+            yield RaceScheduleWidget(id="schedule_panel", loading_state=self.loading_state)
+            yield RaceResultsWidget(id="results_panel", loading_state=self.loading_state)
+
+        yield StatusBar(self.loading_state, id="status_bar")
 
         with Container(id="navigation"):
             yield RaceNavigationBar()
 
         yield Footer()
+
+        # Global loading overlay
+        yield GlobalLoadingOverlay(self.loading_state, id="global_loading")
 
     def on_mount(self):
         # Set initial focus
@@ -485,7 +776,7 @@ class F1DashboardApp(App):
 
     def action_refresh(self):
         """Refresh all data"""
-        for panel in self.query(Static):
+        for panel in self.query(LoadableWidget):
             if hasattr(panel, "update_content"):
                 panel.update_content()
 
